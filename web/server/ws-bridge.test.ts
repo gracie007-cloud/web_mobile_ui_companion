@@ -6,6 +6,7 @@ vi.mock("node:crypto", () => ({ randomUUID: () => "test-uuid" }));
 
 import { WsBridge, type SocketData } from "./ws-bridge.js";
 import { SessionStore } from "./session-store.js";
+import { containerManager } from "./container-manager.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -50,7 +51,7 @@ function makeInitMsg(overrides: Record<string, unknown> = {}) {
     type: "system",
     subtype: "init",
     session_id: "cli-123",
-    model: "claude-sonnet-4-5-20250929",
+    model: "claude-sonnet-4-6",
     cwd: "/test",
     tools: ["Bash", "Read"],
     permissionMode: "default",
@@ -277,14 +278,14 @@ describe("CLI handlers", () => {
     bridge.handleCLIMessage(cli, makeInitMsg());
 
     const session = bridge.getSession("s1")!;
-    expect(session.state.model).toBe("claude-sonnet-4-5-20250929");
+    expect(session.state.model).toBe("claude-sonnet-4-6");
     expect(session.state.cwd).toBe("/test");
 
     // Should broadcast session_init to browser
     const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
     const initCall = calls.find((c: any) => c.type === "session_init");
     expect(initCall).toBeDefined();
-    expect(initCall.session.model).toBe("claude-sonnet-4-5-20250929");
+    expect(initCall.session.model).toBe("claude-sonnet-4-6");
   });
 
   it("handleCLIMessage: system.init fires onCLISessionIdReceived callback", () => {
@@ -338,12 +339,8 @@ describe("CLI handlers", () => {
     // markContainerized sets the host cwd and is_containerized before CLI connects
     bridge.markContainerized("s1", "/Users/stan/Dev/myproject");
 
-    mockExecSync.mockImplementation((cmd: string) => {
-      if (cmd.includes("--abbrev-ref HEAD")) return "main\n";
-      if (cmd.includes("--git-dir")) return ".git\n";
-      if (cmd.includes("--show-toplevel")) return "/Users/stan/Dev/myproject\n";
-      if (cmd.includes("--left-right --count")) return "0\t0\n";
-      throw new Error("unknown git cmd");
+    mockExecSync.mockImplementation(() => {
+      throw new Error("container not tracked");
     });
 
     const cli = makeCliSocket("s1");
@@ -355,8 +352,99 @@ describe("CLI handlers", () => {
     const state = bridge.getSession("s1")!.state;
     expect(state.cwd).toBe("/Users/stan/Dev/myproject");
     expect(state.is_containerized).toBe(true);
-    expect(state.git_branch).toBe("main");
+  });
+
+  it("handleCLIMessage: keeps previous git info when container metadata is temporarily unavailable", () => {
+    const session = bridge.getOrCreateSession("s1");
+    session.state.git_branch = "existing-branch";
+    session.state.repo_root = "/workspace";
+    session.state.git_ahead = 2;
+    session.state.git_behind = 1;
+    bridge.markContainerized("s1", "/Users/stan/Dev/myproject");
+
+    mockExecSync.mockImplementation(() => {
+      throw new Error("container not tracked");
+    });
+
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleCLIMessage(cli, makeInitMsg({ cwd: "/workspace" }));
+
+    const state = bridge.getSession("s1")!.state;
+    expect(state.git_branch).toBe("existing-branch");
+    expect(state.repo_root).toBe("/workspace");
+    expect(state.git_ahead).toBe(2);
+    expect(state.git_behind).toBe(1);
+  });
+
+  it("handleCLIMessage: resolves git info from container for containerized sessions", () => {
+    bridge.markContainerized("s1", "/Users/stan/Dev/myproject");
+    const getContainerSpy = vi.spyOn(containerManager, "getContainer").mockReturnValue({
+      containerId: "abc123def456",
+      name: "companion-test",
+      image: "the-companion:latest",
+      portMappings: [],
+      hostCwd: "/Users/stan/Dev/myproject",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (!cmd.startsWith("docker exec abc123def456 sh -lc ")) {
+        throw new Error(`unexpected command: ${cmd}`);
+      }
+      if (cmd.includes("--abbrev-ref HEAD")) return "container-branch\n";
+      if (cmd.includes("--git-dir")) return ".git\n";
+      if (cmd.includes("--show-toplevel")) return "/workspace\n";
+      if (cmd.includes("--left-right --count")) return "1\t3\n";
+      throw new Error(`unknown git cmd: ${cmd}`);
+    });
+
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleCLIMessage(cli, makeInitMsg({ cwd: "/workspace" }));
+
+    const state = bridge.getSession("s1")!.state;
+    expect(state.cwd).toBe("/Users/stan/Dev/myproject");
+    expect(state.git_branch).toBe("container-branch");
     expect(state.repo_root).toBe("/Users/stan/Dev/myproject");
+    expect(state.git_behind).toBe(1);
+    expect(state.git_ahead).toBe(3);
+    expect(getContainerSpy).toHaveBeenCalledWith("s1");
+    getContainerSpy.mockRestore();
+  });
+
+  it("handleCLIMessage: maps nested container repo_root paths back to host paths", () => {
+    bridge.markContainerized("s1", "/Users/stan/Dev/myproject");
+    const getContainerSpy = vi.spyOn(containerManager, "getContainer").mockReturnValue({
+      containerId: "abc123def456",
+      name: "companion-test",
+      image: "the-companion:latest",
+      portMappings: [],
+      hostCwd: "/Users/stan/Dev/myproject",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (!cmd.startsWith("docker exec abc123def456 sh -lc ")) {
+        throw new Error(`unexpected command: ${cmd}`);
+      }
+      if (cmd.includes("--abbrev-ref HEAD")) return "container-branch\n";
+      if (cmd.includes("--git-dir")) return ".git\n";
+      if (cmd.includes("--show-toplevel")) return "/workspace/packages/api\n";
+      if (cmd.includes("--left-right --count")) return "0\t0\n";
+      throw new Error(`unknown git cmd: ${cmd}`);
+    });
+
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleCLIMessage(cli, makeInitMsg({ cwd: "/workspace" }));
+
+    const state = bridge.getSession("s1")!.state;
+    expect(state.repo_root).toBe("/Users/stan/Dev/myproject/packages/api");
+    expect(getContainerSpy).toHaveBeenCalledWith("s1");
+    getContainerSpy.mockRestore();
   });
 
   it("handleCLIMessage: system.init resolves git info via execSync", () => {
@@ -419,6 +507,65 @@ describe("CLI handlers", () => {
 
     const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
     expect(calls).toContainEqual(expect.objectContaining({ type: "status_change", status: "compacting" }));
+  });
+
+  it("handleCLIMessage: forwards compact_boundary as system_event and persists it", () => {
+    const cli = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "system",
+      subtype: "compact_boundary",
+      compact_metadata: { trigger: "auto", pre_tokens: 4096 },
+      uuid: "uuid-compact",
+      session_id: "s1",
+    }));
+
+    const session = bridge.getSession("s1")!;
+    expect(session.messageHistory).toHaveLength(1);
+    expect(session.messageHistory[0]).toMatchObject({
+      type: "system_event",
+      event: {
+        subtype: "compact_boundary",
+      },
+    });
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const forwarded = calls.find((c: any) => c.type === "system_event");
+    expect(forwarded).toBeDefined();
+    expect(forwarded.event.subtype).toBe("compact_boundary");
+  });
+
+  it("handleCLIMessage: forwards hook_progress as system_event without persisting history", () => {
+    const cli = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "system",
+      subtype: "hook_progress",
+      hook_id: "hk-1",
+      hook_name: "lint",
+      hook_event: "post_tool_use",
+      stdout: "running",
+      stderr: "",
+      output: "running",
+      uuid: "uuid-hook-progress",
+      session_id: "s1",
+    }));
+
+    const session = bridge.getSession("s1")!;
+    expect(session.messageHistory).toHaveLength(0);
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const forwarded = calls.find((c: any) => c.type === "system_event");
+    expect(forwarded).toBeDefined();
+    expect(forwarded.event.subtype).toBe("hook_progress");
   });
 
   it("handleCLIClose: nulls cliSocket and broadcasts cli_disconnected", () => {
@@ -528,7 +675,7 @@ describe("Browser handlers", () => {
         id: "msg-1",
         type: "message",
         role: "assistant",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         content: [{ type: "text", text: "Hello!" }],
         stop_reason: null,
         usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -669,7 +816,7 @@ describe("Browser handlers", () => {
         id: "hist-1",
         type: "message",
         role: "assistant",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         content: [{ type: "text", text: "from history" }],
         stop_reason: "end_turn",
         usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -716,6 +863,145 @@ describe("Browser handlers", () => {
     expect(replayMsg.events.some((e: any) => e.message.type === "stream_event")).toBe(true);
   });
 
+  it("session_subscribe: sends ground-truth status_change=idle after event_replay when last history is result", () => {
+    // When the CLI finished (result in messageHistory), the server should send
+    // a status_change after event_replay so the browser clears stale "running" state.
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+
+    // Simulate a completed turn: assistant → result in history
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "a1",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "hello" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      parent_tool_use_id: null,
+      uuid: "u1",
+      session_id: "s1",
+    }));
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "result",
+      is_error: false,
+      total_cost_usd: 0.01,
+      num_turns: 1,
+      session_id: "s1",
+    }));
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "session_subscribe",
+      last_seq: 0,
+    }));
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    // Last message should be a status_change with idle
+    const statusMsg = calls.filter((c: any) => c.type === "status_change");
+    expect(statusMsg.length).toBeGreaterThanOrEqual(1);
+    const lastStatus = statusMsg[statusMsg.length - 1];
+    expect(lastStatus.status).toBe("idle");
+  });
+
+  it("session_subscribe: sends ground-truth status_change=running after event_replay when last history is assistant", () => {
+    // When the CLI is mid-turn (assistant in messageHistory but no result yet),
+    // the ground-truth status should be "running".
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "a1",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "working on it" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      parent_tool_use_id: null,
+      uuid: "u1",
+      session_id: "s1",
+    }));
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "session_subscribe",
+      last_seq: 0,
+    }));
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const statusMsg = calls.filter((c: any) => c.type === "status_change");
+    expect(statusMsg.length).toBeGreaterThanOrEqual(1);
+    const lastStatus = statusMsg[statusMsg.length - 1];
+    expect(lastStatus.status).toBe("running");
+  });
+
+  it("session_subscribe: sends status_change=idle in gap path when session completed", () => {
+    // Even when falling back to message_history + transient replay,
+    // a trailing status_change should correct stale state.
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "a1",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "done" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      parent_tool_use_id: null,
+      uuid: "u1",
+      session_id: "s1",
+    }));
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "result",
+      is_error: false,
+      total_cost_usd: 0.01,
+      num_turns: 1,
+      session_id: "s1",
+    }));
+    // Add a stream event and then force a gap by trimming the buffer
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "x" } },
+      parent_tool_use_id: null,
+      uuid: "se1",
+      session_id: "s1",
+    }));
+    const session = bridge.getSession("s1")!;
+    session.eventBuffer.shift(); // force a gap
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "session_subscribe",
+      last_seq: 1,
+    }));
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const statusMsg = calls.filter((c: any) => c.type === "status_change");
+    expect(statusMsg.length).toBeGreaterThanOrEqual(1);
+    expect(statusMsg[statusMsg.length - 1].status).toBe("idle");
+  });
+
   it("session_ack: updates lastAckSeq for the session", () => {
     const browser = makeBrowserSocket("s1");
     bridge.handleBrowserOpen(browser, "s1");
@@ -751,7 +1037,7 @@ describe("CLI message routing", () => {
         id: "msg-1",
         type: "message",
         role: "assistant",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         content: [{ type: "text", text: "Hello world!" }],
         stop_reason: "end_turn",
         usage: { input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -860,7 +1146,7 @@ describe("CLI message routing", () => {
       stop_reason: "end_turn",
       usage: { input_tokens: 500, output_tokens: 200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
       modelUsage: {
-        "claude-sonnet-4-5-20250929": {
+        "claude-sonnet-4-6": {
           inputTokens: 8000,
           outputTokens: 2000,
           cacheReadInputTokens: 0,
@@ -1349,7 +1635,7 @@ describe("Persistence", () => {
       id: "persisted-1",
       state: {
         session_id: "persisted-1",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/saved",
         tools: ["Bash"],
         permissionMode: "default",
@@ -1384,7 +1670,7 @@ describe("Persistence", () => {
 
     const session = bridge.getSession("persisted-1");
     expect(session).toBeDefined();
-    expect(session!.state.model).toBe("claude-sonnet-4-5-20250929");
+    expect(session!.state.model).toBe("claude-sonnet-4-6");
     expect(session!.state.cwd).toBe("/saved");
     expect(session!.state.total_cost_usd).toBe(0.1);
     expect(session!.messageHistory).toHaveLength(1);
@@ -1454,7 +1740,7 @@ describe("Persistence", () => {
 
     const lastCall = saveSpy.mock.calls[saveSpy.mock.calls.length - 1][0];
     expect(lastCall.id).toBe("s1");
-    expect(lastCall.state.model).toBe("claude-sonnet-4-5-20250929");
+    expect(lastCall.state.model).toBe("claude-sonnet-4-6");
 
     saveSpy.mockClear();
 
@@ -1465,7 +1751,7 @@ describe("Persistence", () => {
         id: "msg-1",
         type: "message",
         role: "assistant",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         content: [{ type: "text", text: "Test" }],
         stop_reason: "end_turn",
         usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -2078,7 +2364,7 @@ describe("Restore from disk with pendingPermissions", () => {
       id: "perm-session",
       state: {
         session_id: "perm-session",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: ["Bash", "Edit"],
         permissionMode: "default",
@@ -2129,7 +2415,7 @@ describe("Restore from disk with pendingPermissions", () => {
       id: "perm-replay",
       state: {
         session_id: "perm-replay",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: ["Bash"],
         permissionMode: "default",
@@ -2187,7 +2473,7 @@ describe("Restore from disk with pendingPermissions", () => {
       id: "empty-perms",
       state: {
         session_id: "empty-perms",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: [],
         permissionMode: "default",
@@ -2228,7 +2514,7 @@ describe("Restore from disk with pendingPermissions", () => {
       id: "no-perms-field",
       state: {
         session_id: "no-perms-field",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: [],
         permissionMode: "default",
@@ -2659,7 +2945,7 @@ describe("onFirstTurnCompletedCallback", () => {
       id: "restored-1",
       state: {
         session_id: "restored-1",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: [],
         permissionMode: "default",
@@ -2722,7 +3008,7 @@ describe("onFirstTurnCompletedCallback", () => {
       id: "fresh-restored",
       state: {
         session_id: "fresh-restored",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: [],
         permissionMode: "default",
@@ -2960,5 +3246,111 @@ describe("MCP control messages", () => {
     expect(sent.request.subtype).toBe("mcp_set_servers");
     expect(sent.request.servers).toEqual(servers);
     vi.useRealTimers();
+  });
+});
+
+// ─── Per-session listener error handling ────────────────────────────────────
+
+describe("per-session listener error handling", () => {
+  it("catches and logs errors thrown by assistant message listeners", () => {
+    // A throwing listener should not crash the message pipeline or prevent
+    // persistSession from running.
+    const sessionId = "listener-error-session";
+    const cli = makeCliSocket(sessionId);
+    bridge.handleCLIOpen(cli, sessionId);
+    bridge.handleCLIMessage(cli, makeInitMsg());
+
+    const browser = makeBrowserSocket(sessionId);
+    bridge.handleBrowserOpen(browser, sessionId);
+
+    // Register a throwing listener
+    const throwingCb = () => { throw new Error("listener boom"); };
+    bridge.onAssistantMessageForSession(sessionId, throwingCb);
+
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Send an assistant message — should not throw
+    const assistantMsg = JSON.stringify({
+      type: "assistant",
+      message: { id: "m1", type: "message", role: "assistant", content: [{ type: "text", text: "hi" }], model: "test", stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+    });
+    bridge.handleCLIMessage(cli, assistantMsg);
+
+    expect(spy).toHaveBeenCalledWith(
+      expect.stringContaining("Assistant listener error"),
+      expect.any(Error),
+    );
+
+    spy.mockRestore();
+  });
+
+  it("catches and logs errors from async result listeners", () => {
+    // An async result listener that rejects should have its rejection caught
+    // and logged, not become an unhandled promise rejection.
+    const sessionId = "async-listener-session";
+    const cli = makeCliSocket(sessionId);
+    bridge.handleCLIOpen(cli, sessionId);
+    bridge.handleCLIMessage(cli, makeInitMsg());
+
+    const browser = makeBrowserSocket(sessionId);
+    bridge.handleBrowserOpen(browser, sessionId);
+
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Register a sync-throwing listener for result
+    const throwingCb = () => { throw new Error("result listener boom"); };
+    bridge.onResultForSession(sessionId, throwingCb);
+
+    // Send a result message
+    const resultMsg = JSON.stringify({
+      type: "result",
+      data: { subtype: "success" },
+      total_cost_usd: 0.01,
+      num_turns: 1,
+      is_error: false,
+    });
+    bridge.handleCLIMessage(cli, resultMsg);
+
+    expect(spy).toHaveBeenCalledWith(
+      expect.stringContaining("Result listener error"),
+      expect.any(Error),
+    );
+
+    spy.mockRestore();
+  });
+});
+
+// ─── sendToCLI error handling ──────────────────────────────────────────────
+
+describe("sendToCLI error path", () => {
+  it("logs error when CLI socket send throws", () => {
+    // When the CLI socket's send() throws (e.g. socket already closed),
+    // sendToCLI should catch the error and log it rather than crashing.
+    const sessionId = "send-error-session";
+
+    const cli = makeCliSocket(sessionId);
+    bridge.handleCLIOpen(cli, sessionId);
+
+    // Send a system.init to fully connect the session
+    const initMsg = makeInitMsg();
+    bridge.handleCLIMessage(cli, initMsg);
+
+    // Now make send() throw to simulate a broken socket
+    cli.send.mockImplementation(() => {
+      throw new Error("Socket is closed");
+    });
+
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Inject a user message which calls sendToCLI internally
+    bridge.injectUserMessage(sessionId, "test message");
+
+    // The error should be caught and logged, not thrown
+    expect(spy).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to send to CLI"),
+      expect.any(Error),
+    );
+
+    spy.mockRestore();
   });
 });

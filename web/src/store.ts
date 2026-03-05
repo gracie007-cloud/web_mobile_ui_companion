@@ -1,6 +1,23 @@
 import { create } from "zustand";
-import type { SessionState, PermissionRequest, ChatMessage, SdkSessionInfo, TaskItem, McpServerDetail } from "./types.js";
-import type { UpdateInfo, PRStatusResponse, CreationProgressEvent } from "./api.js";
+import type { SessionState, PermissionRequest, ChatMessage, SdkSessionInfo, TaskItem, ProcessItem, ProcessStatus, McpServerDetail } from "./types.js";
+import type { UpdateInfo, PRStatusResponse, CreationProgressEvent, LinearIssue } from "./api.js";
+import { type TaskPanelConfig, getInitialTaskPanelConfig, getDefaultConfig, persistTaskPanelConfig, SECTION_DEFINITIONS } from "./components/task-panel-sections.js";
+
+/** Delete a key from a Map, returning the same reference if the key wasn't present. */
+function deleteFromMap<K, V>(map: Map<K, V>, key: K): Map<K, V> {
+  if (!map.has(key)) return map;
+  const next = new Map(map);
+  next.delete(key);
+  return next;
+}
+
+/** Delete a key from a Set, returning the same reference if the key wasn't present. */
+function deleteFromSet<V>(set: Set<V>, key: V): Set<V> {
+  if (!set.has(key)) return set;
+  const next = new Set(set);
+  next.delete(key);
+  return next;
+}
 
 export interface QuickTerminalTab {
   id: string;
@@ -13,7 +30,13 @@ export type QuickTerminalPlacement = "top" | "right" | "bottom" | "left";
 
 export type DiffBase = "last-commit" | "default-branch";
 
+const AUTH_STORAGE_KEY = "companion_auth_token";
+
 interface AppState {
+  // Auth
+  authToken: string | null;
+  isAuthenticated: boolean;
+
   // Sessions
   sessions: Map<string, SessionState>;
   sdkSessions: SdkSessionInfo[];
@@ -32,8 +55,17 @@ interface AppState {
   // Pending permissions per session (outer key = sessionId, inner key = request_id)
   pendingPermissions: Map<string, Map<string, PermissionRequest>>;
 
-  // Connection state per session
+  // AI-resolved permissions log per session
+  aiResolvedPermissions: Map<string, Array<{
+    request: PermissionRequest;
+    behavior: "allow" | "deny";
+    reason: string;
+    timestamp: number;
+  }>>;
+
+  /** Browser↔Server WebSocket connection state per session */
   connectionStatus: Map<string, "connecting" | "connected" | "disconnected">;
+  /** CLI process↔Server connection state (pushed by server via "cli_connected"/"cli_disconnected") */
   cliConnected: Map<string, boolean>;
 
   // Session status
@@ -45,8 +77,13 @@ interface AppState {
   // Tasks per session
   sessionTasks: Map<string, TaskItem[]>;
 
-  // Files changed by the agent per session (Edit/Write tool calls)
-  changedFiles: Map<string, Set<string>>;
+  // Tick incremented when agent edits an in-scope file — used to trigger DiffPanel re-fetch
+  changedFilesTick: Map<string, number>;
+  // Count of files changed per session as reported by git (set by DiffPanel)
+  gitChangedFilesCount: Map<string, number>;
+
+  // Background processes per session (Bash with run_in_background)
+  sessionProcesses: Map<string, ProcessItem[]>;
 
   // Session display names
   sessionNames: Map<string, string>;
@@ -55,6 +92,9 @@ interface AppState {
 
   // PR status per session (pushed by server via WebSocket)
   prStatus: Map<string, PRStatusResponse>;
+
+  // Linear issues linked to sessions
+  linkedLinearIssues: Map<string, LinearIssue>;
 
   // MCP servers per session
   mcpServers: Map<string, McpServerDetail[]>;
@@ -68,6 +108,7 @@ interface AppState {
   // Update info
   updateInfo: UpdateInfo | null;
   updateDismissedVersion: string | null;
+  updateOverlayActive: boolean;
 
   // Session creation progress (SSE streaming)
   creationProgress: CreationProgressEvent[] | null;
@@ -85,10 +126,17 @@ interface AppState {
   notificationDesktop: boolean;
   sidebarOpen: boolean;
   taskPanelOpen: boolean;
+  taskPanelConfig: TaskPanelConfig;
+  taskPanelConfigMode: boolean;
   homeResetKey: number;
-  activeTab: "chat" | "diff" | "terminal";
+  editorTabEnabled: boolean;
+  activeTab: "chat" | "diff" | "terminal" | "processes" | "editor";
   chatTabReentryTickBySession: Map<string, number>;
   diffPanelSelectedFile: Map<string, string>;
+
+  // Auth actions
+  setAuthToken: (token: string) => void;
+  logout: () => void;
 
   // Actions
   setDarkMode: (v: boolean) => void;
@@ -99,6 +147,11 @@ interface AppState {
   toggleNotificationDesktop: () => void;
   setSidebarOpen: (v: boolean) => void;
   setTaskPanelOpen: (open: boolean) => void;
+  setTaskPanelConfigMode: (open: boolean) => void;
+  toggleSectionEnabled: (sectionId: string) => void;
+  moveSectionUp: (sectionId: string) => void;
+  moveSectionDown: (sectionId: string) => void;
+  resetTaskPanelConfig: () => void;
   newSession: () => void;
 
   // Session actions
@@ -118,6 +171,8 @@ interface AppState {
   // Permission actions
   addPermission: (sessionId: string, perm: PermissionRequest) => void;
   removePermission: (sessionId: string, requestId: string) => void;
+  addAiResolvedPermission: (sessionId: string, entry: { request: PermissionRequest; behavior: "allow" | "deny"; reason: string; timestamp: number }) => void;
+  setSessionAiValidation: (sessionId: string, settings: { aiValidationEnabled?: boolean | null; aiValidationAutoApprove?: boolean | null; aiValidationAutoDeny?: boolean | null }) => void;
 
   // Task actions
   addTask: (sessionId: string, task: TaskItem) => void;
@@ -125,8 +180,13 @@ interface AppState {
   updateTask: (sessionId: string, taskId: string, updates: Partial<TaskItem>) => void;
 
   // Changed files actions
-  addChangedFile: (sessionId: string, filePath: string) => void;
-  clearChangedFiles: (sessionId: string) => void;
+  bumpChangedFilesTick: (sessionId: string) => void;
+  setGitChangedFilesCount: (sessionId: string, count: number) => void;
+
+  // Process actions
+  addProcess: (sessionId: string, process: ProcessItem) => void;
+  updateProcess: (sessionId: string, taskId: string, updates: Partial<ProcessItem>) => void;
+  updateProcessByToolUseId: (sessionId: string, toolUseId: string, updates: Partial<ProcessItem>) => void;
 
   // Session name actions
   setSessionName: (sessionId: string, name: string) => void;
@@ -135,6 +195,9 @@ interface AppState {
 
   // PR status action
   setPRStatus: (sessionId: string, status: PRStatusResponse) => void;
+
+  // Linear issue actions
+  setLinkedLinearIssue: (sessionId: string, issue: LinearIssue | null) => void;
 
   // MCP actions
   setMcpServers: (sessionId: string, servers: McpServerDetail[]) => void;
@@ -157,9 +220,11 @@ interface AppState {
   // Update actions
   setUpdateInfo: (info: UpdateInfo | null) => void;
   dismissUpdate: (version: string) => void;
+  setUpdateOverlayActive: (active: boolean) => void;
+  setEditorTabEnabled: (enabled: boolean) => void;
 
   // Diff panel actions
-  setActiveTab: (tab: "chat" | "diff" | "terminal") => void;
+  setActiveTab: (tab: "chat" | "diff" | "terminal" | "processes" | "editor") => void;
   markChatTabReentry: (sessionId: string) => void;
   setDiffPanelSelectedFile: (sessionId: string, filePath: string | null) => void;
 
@@ -179,7 +244,6 @@ interface AppState {
   openQuickTerminal: (opts: { target: "host" | "docker"; cwd: string; containerId?: string; reuseIfExists?: boolean }) => void;
   closeQuickTerminalTab: (tabId: string) => void;
   setActiveQuickTerminalTabId: (tabId: string | null) => void;
-  setQuickTerminalPlacement: (placement: QuickTerminalPlacement) => void;
   resetQuickTerminal: () => void;
 
   // Diff settings actions
@@ -263,7 +327,14 @@ function getInitialDiffBase(): DiffBase {
   return "last-commit";
 }
 
+function getInitialAuthToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem(AUTH_STORAGE_KEY) || null;
+}
+
 export const useStore = create<AppState>((set) => ({
+  authToken: getInitialAuthToken(),
+  isAuthenticated: getInitialAuthToken() !== null,
   sessions: new Map(),
   sdkSessions: [],
   currentSessionId: getInitialSessionId(),
@@ -272,15 +343,19 @@ export const useStore = create<AppState>((set) => ({
   streamingStartedAt: new Map(),
   streamingOutputTokens: new Map(),
   pendingPermissions: new Map(),
+  aiResolvedPermissions: new Map(),
   connectionStatus: new Map(),
   cliConnected: new Map(),
   sessionStatus: new Map(),
   previousPermissionMode: new Map(),
   sessionTasks: new Map(),
-  changedFiles: new Map(),
+  changedFilesTick: new Map(),
+  gitChangedFilesCount: new Map(),
+  sessionProcesses: new Map(),
   sessionNames: getInitialSessionNames(),
   recentlyRenamed: new Set(),
   prStatus: new Map(),
+  linkedLinearIssues: new Map(),
   mcpServers: new Map(),
   toolProgress: new Map(),
   collapsedProjects: getInitialCollapsedProjects(),
@@ -290,12 +365,16 @@ export const useStore = create<AppState>((set) => ({
   sessionCreatingBackend: null,
   updateInfo: null,
   updateDismissedVersion: getInitialDismissedVersion(),
+  updateOverlayActive: false,
   darkMode: getInitialDarkMode(),
   notificationSound: getInitialNotificationSound(),
   notificationDesktop: getInitialNotificationDesktop(),
   sidebarOpen: typeof window !== "undefined" ? window.innerWidth >= 768 : true,
   taskPanelOpen: typeof window !== "undefined" ? window.innerWidth >= 1024 : true,
+  taskPanelConfig: getInitialTaskPanelConfig(),
+  taskPanelConfigMode: false,
   homeResetKey: 0,
+  editorTabEnabled: false,
   activeTab: "chat",
   chatTabReentryTickBySession: new Map(),
   diffPanelSelectedFile: new Map(),
@@ -323,6 +402,15 @@ export const useStore = create<AppState>((set) => ({
   clearCreation: () => set({ creationProgress: null, creationError: null, sessionCreating: false, sessionCreatingBackend: null }),
   setSessionCreating: (creating, backend) => set({ sessionCreating: creating, sessionCreatingBackend: backend ?? null }),
   setCreationError: (error) => set({ creationError: error }),
+
+  setAuthToken: (token) => {
+    localStorage.setItem(AUTH_STORAGE_KEY, token);
+    set({ authToken: token, isAuthenticated: true });
+  },
+  logout: () => {
+    localStorage.removeItem(AUTH_STORAGE_KEY);
+    set({ authToken: null, isAuthenticated: false });
+  },
 
   setDarkMode: (v) => {
     localStorage.setItem("cc-dark-mode", String(v));
@@ -356,6 +444,41 @@ export const useStore = create<AppState>((set) => ({
     }),
   setSidebarOpen: (v) => set({ sidebarOpen: v }),
   setTaskPanelOpen: (open) => set({ taskPanelOpen: open }),
+  setTaskPanelConfigMode: (open) => set({ taskPanelConfigMode: open }),
+  toggleSectionEnabled: (sectionId) =>
+    set((s) => {
+      const config: TaskPanelConfig = {
+        order: [...s.taskPanelConfig.order],
+        enabled: { ...s.taskPanelConfig.enabled, [sectionId]: !s.taskPanelConfig.enabled[sectionId] },
+      };
+      persistTaskPanelConfig(config);
+      return { taskPanelConfig: config };
+    }),
+  moveSectionUp: (sectionId) =>
+    set((s) => {
+      const order = [...s.taskPanelConfig.order];
+      const idx = order.indexOf(sectionId);
+      if (idx <= 0) return s;
+      [order[idx - 1], order[idx]] = [order[idx], order[idx - 1]];
+      const config: TaskPanelConfig = { ...s.taskPanelConfig, order };
+      persistTaskPanelConfig(config);
+      return { taskPanelConfig: config };
+    }),
+  moveSectionDown: (sectionId) =>
+    set((s) => {
+      const order = [...s.taskPanelConfig.order];
+      const idx = order.indexOf(sectionId);
+      if (idx < 0 || idx >= order.length - 1) return s;
+      [order[idx], order[idx + 1]] = [order[idx + 1], order[idx]];
+      const config: TaskPanelConfig = { ...s.taskPanelConfig, order };
+      persistTaskPanelConfig(config);
+      return { taskPanelConfig: config };
+    }),
+  resetTaskPanelConfig: () => {
+    const config = getDefaultConfig();
+    persistTaskPanelConfig(config);
+    set({ taskPanelConfig: config });
+  },
   newSession: () => {
     localStorage.removeItem("cc-current-session");
     set((s) => ({ currentSessionId: null, homeResetKey: s.homeResetKey + 1 }));
@@ -389,65 +512,35 @@ export const useStore = create<AppState>((set) => ({
 
   removeSession: (sessionId) =>
     set((s) => {
-      const sessions = new Map(s.sessions);
-      sessions.delete(sessionId);
-      const messages = new Map(s.messages);
-      messages.delete(sessionId);
-      const streaming = new Map(s.streaming);
-      streaming.delete(sessionId);
-      const streamingStartedAt = new Map(s.streamingStartedAt);
-      streamingStartedAt.delete(sessionId);
-      const streamingOutputTokens = new Map(s.streamingOutputTokens);
-      streamingOutputTokens.delete(sessionId);
-      const connectionStatus = new Map(s.connectionStatus);
-      connectionStatus.delete(sessionId);
-      const cliConnected = new Map(s.cliConnected);
-      cliConnected.delete(sessionId);
-      const sessionStatus = new Map(s.sessionStatus);
-      sessionStatus.delete(sessionId);
-      const previousPermissionMode = new Map(s.previousPermissionMode);
-      previousPermissionMode.delete(sessionId);
-      const pendingPermissions = new Map(s.pendingPermissions);
-      pendingPermissions.delete(sessionId);
-      const sessionTasks = new Map(s.sessionTasks);
-      sessionTasks.delete(sessionId);
-      const changedFiles = new Map(s.changedFiles);
-      changedFiles.delete(sessionId);
-      const sessionNames = new Map(s.sessionNames);
-      sessionNames.delete(sessionId);
-      const recentlyRenamed = new Set(s.recentlyRenamed);
-      recentlyRenamed.delete(sessionId);
-      const diffPanelSelectedFile = new Map(s.diffPanelSelectedFile);
-      diffPanelSelectedFile.delete(sessionId);
-      const mcpServers = new Map(s.mcpServers);
-      mcpServers.delete(sessionId);
-      const toolProgress = new Map(s.toolProgress);
-      toolProgress.delete(sessionId);
-      const prStatus = new Map(s.prStatus);
-      prStatus.delete(sessionId);
+      const sessionNames = deleteFromMap(s.sessionNames, sessionId);
       localStorage.setItem("cc-session-names", JSON.stringify(Array.from(sessionNames.entries())));
       if (s.currentSessionId === sessionId) {
         localStorage.removeItem("cc-current-session");
       }
       return {
-        sessions,
-        messages,
-        streaming,
-        streamingStartedAt,
-        streamingOutputTokens,
-        connectionStatus,
-        cliConnected,
-        sessionStatus,
-        previousPermissionMode,
-        pendingPermissions,
-        sessionTasks,
-        changedFiles,
+        sessions: deleteFromMap(s.sessions, sessionId),
+        messages: deleteFromMap(s.messages, sessionId),
+        streaming: deleteFromMap(s.streaming, sessionId),
+        streamingStartedAt: deleteFromMap(s.streamingStartedAt, sessionId),
+        streamingOutputTokens: deleteFromMap(s.streamingOutputTokens, sessionId),
+        connectionStatus: deleteFromMap(s.connectionStatus, sessionId),
+        cliConnected: deleteFromMap(s.cliConnected, sessionId),
+        sessionStatus: deleteFromMap(s.sessionStatus, sessionId),
+        previousPermissionMode: deleteFromMap(s.previousPermissionMode, sessionId),
+        pendingPermissions: deleteFromMap(s.pendingPermissions, sessionId),
+        aiResolvedPermissions: deleteFromMap(s.aiResolvedPermissions, sessionId),
+        sessionTasks: deleteFromMap(s.sessionTasks, sessionId),
+        changedFilesTick: deleteFromMap(s.changedFilesTick, sessionId),
+        gitChangedFilesCount: deleteFromMap(s.gitChangedFilesCount, sessionId),
+        sessionProcesses: deleteFromMap(s.sessionProcesses, sessionId),
         sessionNames,
-        recentlyRenamed,
-        diffPanelSelectedFile,
-        mcpServers,
-        toolProgress,
-        prStatus,
+        recentlyRenamed: deleteFromSet(s.recentlyRenamed, sessionId),
+        diffPanelSelectedFile: deleteFromMap(s.diffPanelSelectedFile, sessionId),
+        mcpServers: deleteFromMap(s.mcpServers, sessionId),
+        toolProgress: deleteFromMap(s.toolProgress, sessionId),
+        prStatus: deleteFromMap(s.prStatus, sessionId),
+        linkedLinearIssues: deleteFromMap(s.linkedLinearIssues, sessionId),
+        chatTabReentryTickBySession: deleteFromMap(s.chatTabReentryTickBySession, sessionId),
         sdkSessions: s.sdkSessions.filter((sdk) => sdk.sessionId !== sessionId),
         currentSessionId: s.currentSessionId === sessionId ? null : s.currentSessionId,
       };
@@ -534,6 +627,25 @@ export const useStore = create<AppState>((set) => ({
       return { pendingPermissions };
     }),
 
+  addAiResolvedPermission: (sessionId, entry) =>
+    set((s) => {
+      const aiResolvedPermissions = new Map(s.aiResolvedPermissions);
+      const sessionEntries = [...(aiResolvedPermissions.get(sessionId) || []), entry];
+      // Keep only the last 50 entries per session to avoid unbounded growth
+      if (sessionEntries.length > 50) sessionEntries.splice(0, sessionEntries.length - 50);
+      aiResolvedPermissions.set(sessionId, sessionEntries);
+      return { aiResolvedPermissions };
+    }),
+
+  setSessionAiValidation: (sessionId, settings) =>
+    set((s) => {
+      const sessions = new Map(s.sessions);
+      const existing = sessions.get(sessionId);
+      if (!existing) return {};
+      sessions.set(sessionId, { ...existing, ...settings });
+      return { sessions };
+    }),
+
   addTask: (sessionId, task) =>
     set((s) => {
       const sessionTasks = new Map(s.sessionTasks);
@@ -562,20 +674,52 @@ export const useStore = create<AppState>((set) => ({
       return { sessionTasks };
     }),
 
-  addChangedFile: (sessionId, filePath) =>
+  bumpChangedFilesTick: (sessionId) =>
     set((s) => {
-      const changedFiles = new Map(s.changedFiles);
-      const files = new Set(changedFiles.get(sessionId) || []);
-      files.add(filePath);
-      changedFiles.set(sessionId, files);
-      return { changedFiles };
+      const changedFilesTick = new Map(s.changedFilesTick);
+      changedFilesTick.set(sessionId, (changedFilesTick.get(sessionId) ?? 0) + 1);
+      return { changedFilesTick };
     }),
 
-  clearChangedFiles: (sessionId) =>
+  setGitChangedFilesCount: (sessionId, count) =>
     set((s) => {
-      const changedFiles = new Map(s.changedFiles);
-      changedFiles.delete(sessionId);
-      return { changedFiles };
+      const gitChangedFilesCount = new Map(s.gitChangedFilesCount);
+      gitChangedFilesCount.set(sessionId, count);
+      return { gitChangedFilesCount };
+    }),
+
+  addProcess: (sessionId, process) =>
+    set((s) => {
+      const sessionProcesses = new Map(s.sessionProcesses);
+      const processes = [...(sessionProcesses.get(sessionId) || []), process];
+      sessionProcesses.set(sessionId, processes);
+      return { sessionProcesses };
+    }),
+
+  updateProcess: (sessionId, taskId, updates) =>
+    set((s) => {
+      const sessionProcesses = new Map(s.sessionProcesses);
+      const processes = sessionProcesses.get(sessionId);
+      if (processes) {
+        sessionProcesses.set(
+          sessionId,
+          processes.map((p) => (p.taskId === taskId ? { ...p, ...updates } : p)),
+        );
+      }
+      return { sessionProcesses };
+    }),
+
+  updateProcessByToolUseId: (sessionId, toolUseId, updates) =>
+    set((s) => {
+      const sessionProcesses = new Map(s.sessionProcesses);
+      const processes = sessionProcesses.get(sessionId);
+      if (processes) {
+        sessionProcesses.set(
+          sessionId,
+          processes.map((p) => (p.toolUseId === toolUseId ? { ...p, ...updates } : p)),
+        );
+      }
+      return { sessionProcesses };
     }),
 
   setSessionName: (sessionId, name) =>
@@ -605,6 +749,17 @@ export const useStore = create<AppState>((set) => ({
       const prStatus = new Map(s.prStatus);
       prStatus.set(sessionId, status);
       return { prStatus };
+    }),
+
+  setLinkedLinearIssue: (sessionId, issue) =>
+    set((s) => {
+      const linkedLinearIssues = new Map(s.linkedLinearIssues);
+      if (issue) {
+        linkedLinearIssues.set(sessionId, issue);
+      } else {
+        linkedLinearIssues.delete(sessionId);
+      }
+      return { linkedLinearIssues };
     }),
 
   setMcpServers: (sessionId, servers) =>
@@ -684,6 +839,8 @@ export const useStore = create<AppState>((set) => ({
     localStorage.setItem("cc-update-dismissed", version);
     set({ updateDismissedVersion: version });
   },
+  setUpdateOverlayActive: (active) => set({ updateOverlayActive: active }),
+  setEditorTabEnabled: (enabled) => set({ editorTabEnabled: enabled }),
 
   setActiveTab: (tab) => set({ activeTab: tab }),
   markChatTabReentry: (sessionId) =>
@@ -753,12 +910,6 @@ export const useStore = create<AppState>((set) => ({
       };
     }),
   setActiveQuickTerminalTabId: (tabId) => set({ activeQuickTerminalTabId: tabId }),
-  setQuickTerminalPlacement: (placement) => {
-    if (typeof window !== "undefined") {
-      localStorage.setItem("cc-terminal-placement", placement);
-    }
-    set({ quickTerminalPlacement: placement });
-  },
   setDiffBase: (base) => {
     if (typeof window !== "undefined") {
       localStorage.setItem("cc-diff-base", base);
@@ -790,17 +941,23 @@ export const useStore = create<AppState>((set) => ({
       streamingStartedAt: new Map(),
       streamingOutputTokens: new Map(),
       pendingPermissions: new Map(),
+      aiResolvedPermissions: new Map(),
       connectionStatus: new Map(),
       cliConnected: new Map(),
       sessionStatus: new Map(),
       previousPermissionMode: new Map(),
       sessionTasks: new Map(),
-      changedFiles: new Map(),
+      changedFilesTick: new Map(),
+      gitChangedFilesCount: new Map(),
+      sessionProcesses: new Map(),
       sessionNames: new Map(),
       recentlyRenamed: new Set(),
       mcpServers: new Map(),
       toolProgress: new Map(),
       prStatus: new Map(),
+      linkedLinearIssues: new Map(),
+      taskPanelConfigMode: false,
+      editorTabEnabled: false,
       activeTab: "chat" as const,
       chatTabReentryTickBySession: new Map(),
       diffPanelSelectedFile: new Map(),
